@@ -1,0 +1,184 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: 'Amazon Connect Emergency Access notification CloudFormation template'
+Resources:
+####################################################################################
+############ Create SNS Topic
+####################################################################################
+  connectEmergencyAccessNotificationSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties: 
+      DisplayName: 'AWS Alert - User logged in using Amazon Connect Emergency Access'
+      TopicName: !Sub '${AWS::StackName}-connectEmergencyAccessNotificationTopic'
+####################################################################################
+############ IAM Role and Policy for Lambda Function
+####################################################################################
+  connectEmergencyAccessNotificationLambdaPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*:*:*"
+          - Effect: Allow
+            Action:
+              - sns:Publish
+            Resource:
+              - !Sub ${connectEmergencyAccessNotificationSNSTopic}
+  connectEmergencyAccessNotificationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref connectEmergencyAccessNotificationLambdaPolicy
+####################################################################################
+############ Lambda Function
+####################################################################################
+  connectEmergencyAccessLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.handler
+      Runtime: nodejs16.x
+      MemorySize: 512
+      Timeout: 10
+      FunctionName: !Sub '${AWS::StackName}-connectEmergencyAccessNotificationLambda'
+      Role: !GetAtt
+        - connectEmergencyAccessNotificationLambdaRole
+        - Arn
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Sub ${connectEmergencyAccessNotificationSNSTopic}
+      Code: 
+        ZipFile: |
+          'use strict';
+          const AWS = require('aws-sdk');
+          const connect = new AWS.Connect();
+          var SNS = new AWS.SNS();
+
+          const {
+            SNS_TOPIC_ARN
+          } = process.env;
+
+          //*********************************************************************************************************************************//
+          // This Lambda function is invoked through EventBridge event. An API call is registered in CloudTrail when a user logs into 
+          // Amazon Connect instance using "Emergency Access". The event is "AdminGetEmergencyAccessToken". EventBridge invokes this Lambda function for this event.
+          // This Lambda function parses the JSON, extracts the information and sends notification to the SNS Topic.
+          //*********************************************************************************************************************************//
+
+          exports.handler = (event, context, callback) => {
+              const ReturnResult = {};
+              const eventToProcess = "AdminGetEmergencyAccessToken";
+              console.log('Received event:', event);
+
+              if (event.detail.eventName != eventToProcess) {
+                  console.log ("Invalid Event received: " + event.detail.eventName + ", exiting...");
+                  ReturnResult.Success = true;
+                  callback(null,ReturnResult);
+                  return;
+              }
+              const AWSAccountId = event.account;
+              const EventTime = event.time;
+              const AWSRegion = event.region;
+
+              const principalId = event.detail.userIdentity.principalId.split(":");
+              const pId = principalId[1]; //Extracting last part of principal Id
+
+              const AWSUserName = event.detail.userIdentity.sessionContext.sessionIssuer.userName;
+              const connectInstanceId = getconnectInstanceIdActive(decodeURIComponent(event.detail.requestParameters.InstanceId));
+              
+              console.log ("Principal:" + pId + "/User:" + AWSUserName + " has logged in to Amazon Connect instance:" + connectInstanceId + " in region:" + AWSRegion + " using emergency access");
+              
+              //Publish SNS notification
+              var params = "";
+              var messageText = "This is an alert from Amazon Connect. A user has logged into Amazon Connect instance using Emergency Access - ";
+              messageText = messageText + "AWS Region:" + AWSRegion +
+                  ", AWS Account Id:" +  AWSAccountId +
+                  ", Log in Time:" + EventTime +
+                  ", Principal Id:" + pId +
+                  ", User:" + AWSUserName +
+                  ", Amazon Connect Instance Id:" + connectInstanceId;
+              console.log ("Notification Message:", messageText);
+
+              params = {
+                  TopicArn: process.env.SNS_TOPIC_ARN,
+                  Message: messageText,
+                  Subject: "AWS ALERT - Amazon Connect Emergency Access used to log in",
+                  MessageAttributes: {
+                      "SNSSource": {
+                      "DataType": "String",
+                      "StringValue": "Lambda"
+                      }
+                  }
+              };
+
+              console.log ("SNS Params:", params);
+
+              
+              try {
+              SNS.publish(params, function(err, data){
+                  console.log('Publishing message:' + messageText + ' to SNS topic');
+                  if (err){
+                    console.log(err, err.stack);
+                    ReturnResult.success = false;
+                    callback(null,ReturnResult);
+                  }
+                  console.log('Message published to SNS topic');
+                  ReturnResult.Success = true;
+                  callback(null,ReturnResult);
+              });
+              }
+              catch (e) {
+                  console.log ("Received error ", e);
+              }
+          };
+
+          const getconnectInstanceIdActive = (connectArn) => {
+            const instanceArnSplit = connectArn.split('/');
+            return instanceArnSplit[instanceArnSplit.length - 1];
+          };
+######################End of Lambda function########################################
+####################################################################################
+############ Create an EventsBridge Rule and invoke permission for Lambda Function
+####################################################################################
+  eventsBridgeRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: AWS EventsBridge rule to invoke Lambda when a user logs into Amazon Connect via emergency access
+      EventPattern:
+        source:
+          - aws.connect
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - connect.amazonaws.com
+          eventName:
+            - AdminGetEmergencyAccessToken
+      Name: !Sub '${AWS::StackName}-connectEmergencyAccessNotificationRule'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt 
+            - connectEmergencyAccessLambdaFunction
+            - Arn
+          Id: 'ACEmergencyAccessNotification'
+####################################################################################
+  eventBridgeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt connectEmergencyAccessLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt eventsBridgeRule.Arn
+####################################################################################
